@@ -134,22 +134,27 @@ static void worker(
     const Path &gcRootsDir)
 {
     Value vTop;
+    std::shared_ptr<nix::FlakeRef> flakeRef;
+    std::shared_ptr<flake::LockedFlake> lockedFlake;
+    std::string fragment;
 
     if (myArgs.flake) {
         using namespace flake;
 
-        auto [flakeRef, fragment] = parseFlakeRefWithFragment(myArgs.releaseExpr, absPath("."));
+        auto parse = parseFlakeRefWithFragment(myArgs.releaseExpr, absPath("."));
+        flakeRef = std::make_shared<nix::FlakeRef>(parse.first);
+        fragment = parse.second;
 
         auto vFlake = state.allocValue();
 
-        auto lockedFlake = lockFlake(state, flakeRef,
+        lockedFlake = std::make_shared<flake::LockedFlake>(lockFlake(state, *flakeRef,
             LockFlags {
                 .updateLockFile = false,
                 .useRegistries = false,
                 .allowMutable = false,
-            });
+            }));
 
-        callFlake(state, lockedFlake, *vFlake);
+        callFlake(state, *lockedFlake, *vFlake);
 
         auto vOutputs = vFlake->attrs->get(state.symbols.create("outputs"))->value;
         state.forceValue(*vOutputs, noPos);
@@ -183,8 +188,12 @@ static void worker(
 
         /* Evaluate it and send info back to the master. */
         nlohmann::json reply;
-        reply["attr"] = attrPath;
-
+        if (myArgs.flake) {
+            reply["attrPath"] = fragment + "." + attrPath;
+            reply["originalUri"] = flakeRef->to_string();
+        } else {
+            reply["attrPath"] = attrPath;
+        }
         try {
             auto vTmp = findAlongAttrPath(state, attrPath, autoArgs, *vRoot).first;
 
@@ -201,11 +210,22 @@ static void worker(
                 auto storePath = localStore->parseStorePath(drvPath);
                 auto outputs = drv->queryOutputs(false);
 
-                reply["name"] = drv->queryName();
-                reply["system"] = drv->querySystem();
-                reply["drvPath"] = drvPath;
-                for (auto out : outputs){
-                    reply["outputs"][out.first] = localStore->printStorePath(out.second);
+                reply["active"] = true;
+                if (myArgs.flake) {
+                    reply["uri"] = lockedFlake->flake.lockedRef.to_string();
+                    reply["originalUri"] = flakeRef->to_string();
+                    std::vector<std::string> paths;
+                    for (auto out : outputs){
+                        paths.push_back(localStore->printStorePath(out.second));
+                    }
+                    reply["storePaths"] = paths;
+                } else {
+                   reply["name"] = drv->queryName();
+                   reply["system"] = drv->querySystem();
+                   reply["drvPath"] = drvPath;
+                   for (auto out : outputs){
+                       reply["outputs"][out.first] = localStore->printStorePath(out.second);
+                   }
                 }
 
                 if (myArgs.meta) {

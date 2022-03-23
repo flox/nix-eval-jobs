@@ -40,6 +40,7 @@ struct MyArgs : MixEvalArgs, MixCommonArgs
     bool showTrace = false;
     size_t nrWorkers = 1;
     size_t maxMemorySize = 4096;
+    size_t depth = 1;
     pureEval evalMode = evalAuto;
 
     MyArgs() : MixCommonArgs("nix-eval-jobs")
@@ -57,6 +58,15 @@ struct MyArgs : MixEvalArgs, MixCommonArgs
                 }
                 ::exit(0);
             }},
+        });
+
+        addFlag({
+            .longName = "depth",
+            .description = "maximum evaluation depth",
+            .labels = {"depth"},
+            .handler = {[=](std::string s) {
+                depth = std::stoi(s);
+            }}
         });
 
         addFlag({
@@ -124,22 +134,27 @@ static void worker(
     const Path &gcRootsDir)
 {
     Value vTop;
+    std::shared_ptr<nix::FlakeRef> flakeRef;
+    std::shared_ptr<flake::LockedFlake> lockedFlake;
+    std::string fragment;
 
     if (myArgs.flake) {
         using namespace flake;
 
-        auto [flakeRef, fragment] = parseFlakeRefWithFragment(myArgs.releaseExpr, absPath("."));
+        auto parse = parseFlakeRefWithFragment(myArgs.releaseExpr, absPath("."));
+        flakeRef = std::make_shared<nix::FlakeRef>(parse.first);
+        fragment = parse.second;
 
         auto vFlake = state.allocValue();
 
-        auto lockedFlake = lockFlake(state, flakeRef,
+        lockedFlake = std::make_shared<flake::LockedFlake>(lockFlake(state, *flakeRef,
             LockFlags {
                 .updateLockFile = false,
                 .useRegistries = false,
                 .allowMutable = false,
-            });
+            }));
 
-        callFlake(state, lockedFlake, *vFlake);
+        callFlake(state, *lockedFlake, *vFlake);
 
         auto vOutputs = vFlake->attrs->get(state.symbols.create("outputs"))->value;
         state.forceValue(*vOutputs, noPos);
@@ -173,8 +188,12 @@ static void worker(
 
         /* Evaluate it and send info back to the master. */
         nlohmann::json reply;
-        reply["attr"] = attrPath;
-
+        if (myArgs.flake) {
+            reply["attrPath"] = fragment + "." + attrPath;
+            reply["originalUri"] = flakeRef->to_string();
+        } else {
+            reply["attrPath"] = attrPath;
+        }
         try {
             auto vTmp = findAlongAttrPath(state, attrPath, autoArgs, *vRoot).first;
 
@@ -191,11 +210,22 @@ static void worker(
                 auto storePath = localStore->parseStorePath(drvPath);
                 auto outputs = drv->queryOutputs(false);
 
-                reply["name"] = drv->queryName();
-                reply["system"] = drv->querySystem();
-                reply["drvPath"] = drvPath;
-                for (auto out : outputs){
-                    reply["outputs"][out.first] = localStore->printStorePath(out.second);
+                reply["active"] = true;
+                if (myArgs.flake) {
+                    reply["uri"] = lockedFlake->flake.lockedRef.to_string();
+                    reply["originalUri"] = flakeRef->to_string();
+                    std::vector<std::string> paths;
+                    for (auto out : outputs){
+                        paths.push_back(localStore->printStorePath(out.second));
+                    }
+                    reply["storePaths"] = paths;
+                } else {
+                   reply["name"] = drv->queryName();
+                   reply["system"] = drv->querySystem();
+                   reply["drvPath"] = drvPath;
+                   for (auto out : outputs){
+                       reply["outputs"][out.first] = localStore->printStorePath(out.second);
+                   }
                 }
 
                 if (myArgs.meta) {
@@ -231,17 +261,24 @@ static void worker(
 
             else if (v->type() == nAttrs)
               {
-                auto attrs = nlohmann::json::array();
-                StringSet ss;
-                for (auto & i : v->attrs->lexicographicOrder()) {
-                    std::string name(i->name);
-                    if (name.find('.') != std::string::npos || name.find(' ') != std::string::npos) {
-                        printError("skipping job with illegal name '%s'", name);
-                        continue;
+                // Hacky way to get depth.... fails with embedded "."
+                size_t n = std::count(attrPath.begin(), attrPath.end(), '.')+(attrPath == "" ? 0: 1);
+                if (n < myArgs.depth){
+                    auto attrs = nlohmann::json::array();
+                    Bindings::iterator j = v->attrs->find(state.sRecurseForDerivations);
+                    if ( n==0 || (j != v->attrs->end() && state.forceBool(*j->value, *j->pos))){
+                        StringSet ss;
+                        for (auto & i : v->attrs->lexicographicOrder()) {
+                            std::string name(i->name);
+                            if (name.find('.') != std::string::npos || name.find(' ') != std::string::npos) {
+                                name= "\"" + name + "\"";
+                            }
+                            attrs.push_back(name);
+                        }
                     }
-                    attrs.push_back(name);
+                    reply["attrs"] = std::move(attrs);
                 }
-                reply["attrs"] = std::move(attrs);
+
             }
 
             else if (v->type() == nNull)
